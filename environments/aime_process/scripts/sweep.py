@@ -87,6 +87,10 @@ async def main(args: argparse.Namespace) -> None:
         f"{args.rollouts} rollouts/example  (judge={args.judge_model})"
     )
 
+    sampling_args = (
+        {"max_tokens": args.max_tokens} if args.max_tokens else None
+    )
+
     rows: list[dict] = []
     sweep_t0 = time.time()
     for i, model in enumerate(args.models, 1):
@@ -95,6 +99,7 @@ async def main(args: argparse.Namespace) -> None:
             results = await env.evaluate(
                 client=client,
                 model=model,
+                sampling_args=sampling_args,
                 num_examples=args.num_examples,
                 rollouts_per_example=args.rollouts,
                 max_concurrent=args.max_concurrent,
@@ -126,6 +131,7 @@ async def main(args: argparse.Namespace) -> None:
                 "judge_model": args.judge_model,
                 "num_examples": args.num_examples,
                 "rollouts_per_example": args.rollouts,
+                "max_tokens": args.max_tokens,
                 "sweep_time_s": time.time() - sweep_t0,
                 "rows": rows,
             },
@@ -142,4 +148,10 @@ if __name__ == "__main__":
     parser.add_argument("--rollouts", type=int, default=2)
     parser.add_argument("--max-concurrent", type=int, default=10)
     parser.add_argument("--judge-model", default="anthropic/claude-haiku-4.5")
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        help="Override the model-under-test's max output tokens (default: provider default, often 4096).",
+    )
     asyncio.run(main(parser.parse_args()))
