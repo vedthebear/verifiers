@@ -74,6 +74,7 @@ def _print_leaderboard(rows: list[dict]) -> None:
 async def main(args: argparse.Namespace) -> None:
     env = aime_process.load_environment(
         num_eval_examples=args.num_examples,
+        segmenter_model=args.segmenter_model,
         judge_model=args.judge_model,
     )
     raw_client = AsyncOpenAI(
@@ -84,7 +85,8 @@ async def main(args: argparse.Namespace) -> None:
 
     print(
         f"Sweep: {len(args.models)} models × {args.num_examples} problems × "
-        f"{args.rollouts} rollouts/example  (judge={args.judge_model})"
+        f"{args.rollouts} rollouts/example  "
+        f"(segmenter={args.segmenter_model}, judge={args.judge_model})"
     )
 
     sampling_args = (
@@ -104,7 +106,7 @@ async def main(args: argparse.Namespace) -> None:
                 rollouts_per_example=args.rollouts,
                 max_concurrent=args.max_concurrent,
                 save_results=True,
-                state_columns=["step_audit"],
+                state_columns=["step_audit", "segmented_steps"],
             )
             meta = results["metadata"]
             m = meta["avg_metrics"]
@@ -128,6 +130,7 @@ async def main(args: argparse.Namespace) -> None:
     out_path.write_text(
         json.dumps(
             {
+                "segmenter_model": args.segmenter_model,
                 "judge_model": args.judge_model,
                 "num_examples": args.num_examples,
                 "rollouts_per_example": args.rollouts,
@@ -147,7 +150,8 @@ if __name__ == "__main__":
     parser.add_argument("--num-examples", type=int, default=30)
     parser.add_argument("--rollouts", type=int, default=2)
     parser.add_argument("--max-concurrent", type=int, default=10)
-    parser.add_argument("--judge-model", default="anthropic/claude-haiku-4.5")
+    parser.add_argument("--segmenter-model", default="openai/gpt-4o-mini")
+    parser.add_argument("--judge-model", default="anthropic/claude-sonnet-4.6")
     parser.add_argument(
         "--max-tokens",
         type=int,

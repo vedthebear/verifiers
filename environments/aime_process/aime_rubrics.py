@@ -8,9 +8,55 @@ import verifiers as vf
 from verifiers.types import Messages, State
 
 from aime_parsers import AIMECoTParser
-from aime_prompts import STEP_JUDGE_PROMPT
+from aime_prompts import SEGMENTER_PROMPT, STEP_JUDGE_PROMPT
 
 logger = logging.getLogger(__name__)
+
+
+class StepSegmenter:
+    """One LLM call per rollout returns a JSON list of discrete reasoning steps.
+
+    Cheap model (e.g. gpt-4o-mini) is sufficient — segmentation is a
+    structural task, not a math-judgement task. Verbatim step text is
+    preserved so the downstream judge sees what the model wrote, not a
+    paraphrase.
+    """
+
+    def __init__(
+        self,
+        client: AsyncOpenAI,
+        model: str,
+        prompt_template: str = SEGMENTER_PROMPT,
+        sampling_args: dict[str, Any] | None = None,
+    ):
+        self.client = client
+        self.model = model
+        self.prompt_template = prompt_template
+        self.sampling_args = sampling_args or {
+            "max_tokens": 4096,
+            "temperature": 0.0,
+        }
+
+    STEP_MARKER = "###STEP###"
+
+    async def segment(self, problem: str, completion_text: str) -> list[str]:
+        prompt = self.prompt_template.format(
+            problem=problem, completion=completion_text
+        )
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": prompt}],
+                **self.sampling_args,
+            )
+            content = (response.choices[0].message.content or "").strip()
+            chunks = content.split(self.STEP_MARKER)
+            return [c.strip() for c in chunks if c.strip()]
+        except Exception as exc:
+            logger.warning(
+                "StepSegmenter failed (model=%s): %r", self.model, exc
+            )
+        return []
 
 
 class StepJudge:
@@ -18,11 +64,9 @@ class StepJudge:
 
     One judge call per step (problem, prior accepted steps, current step) ->
     {valid, invalid, unclear}. Score is the fraction of "valid" verdicts over
-    *successfully judged* steps; infra failures are excluded from the
-    denominator and tracked as a streak. After ``ERROR_STREAK_THRESHOLD``
-    consecutive failures the breaker trips: subsequent calls short-circuit to
-    the sentinel without hitting the API, so a flaky judge can't quietly
-    inflate the invalid count or burn budget for the rest of the run.
+    successfully judged steps; infra failures are excluded from the
+    denominator. After ``ERROR_STREAK_THRESHOLD`` consecutive failures the
+    circuit breaker trips and remaining calls short-circuit.
     """
 
     ERROR_SENTINEL = "__judge_error__"
@@ -110,14 +154,15 @@ class AIMEProcessRubric(vf.MathRubric):
     """Compose answer correctness + per-step validity + efficiency metrics.
 
     Inherits ``correct_answer`` from MathRubric (math_verify in a process pool).
-    Adds ``step_validity`` (LLM-judged, contributes to reward) plus two pure
-    metrics (``completion_chars``, ``step_count``) so post-hoc analysis can
-    decompose every score without those metrics shaping the reward.
+    Adds ``step_validity`` (LLM-segmented + LLM-judged with prior-only context)
+    plus two pure metrics (``completion_chars``, ``step_count``).
     """
 
     def __init__(
         self,
         parser: AIMECoTParser,
+        segmenter_client: AsyncOpenAI,
+        segmenter_model: str,
         judge_client: AsyncOpenAI,
         judge_model: str,
         answer_weight: float = 1.0,
@@ -127,13 +172,34 @@ class AIMEProcessRubric(vf.MathRubric):
         # MathRubric.__init__ unconditionally registers ``correct_answer`` with
         # weight 1.0; rebind that weight here so callers can dial it.
         self.weights[0] = answer_weight
-        self.step_judge = StepJudge(
+        self.segmenter = StepSegmenter(
+            client=segmenter_client, model=segmenter_model
+        )
+        self.judge = StepJudge(
             judge_client=judge_client, judge_model=judge_model
         )
-        self.add_class_object("step_judge", self.step_judge)
+        self.add_class_object("segmenter", self.segmenter)
+        self.add_class_object("judge", self.judge)
         self.add_reward_func(self.step_validity, weight=step_weight)
         self.add_metric(self.completion_chars)
         self.add_metric(self.step_count)
+
+    async def _ensure_steps(
+        self,
+        parser: AIMECoTParser,
+        prompt: Messages,
+        completion: Messages,
+        state: State | None,
+    ) -> list[str]:
+        cached = state.get("segmented_steps") if state else None
+        if cached is not None:
+            return list(cached)
+        problem = parser.user_text(prompt)
+        text = parser.completion_text(completion)
+        steps = await self.segmenter.segment(problem, text)
+        if state is not None:
+            state["segmented_steps"] = steps
+        return steps
 
     async def step_validity(
         self,
@@ -147,8 +213,8 @@ class AIMEProcessRubric(vf.MathRubric):
         if cached is not None:
             return float(cached)
         problem = parser.user_text(prompt)
-        steps = parser.segment_steps(completion)
-        score = await self.step_judge.score(problem, steps, state=state)
+        steps = await self._ensure_steps(parser, prompt, completion, state)
+        score = await self.judge.score(problem, steps, state=state)
         if state is not None:
             state["step_validity_score"] = score
         return score
@@ -159,6 +225,12 @@ class AIMEProcessRubric(vf.MathRubric):
         return float(len(parser.completion_text(completion)))
 
     async def step_count(
-        self, parser: AIMECoTParser, completion: Messages, **kwargs
+        self,
+        parser: AIMECoTParser,
+        prompt: Messages,
+        completion: Messages,
+        state: State,
+        **kwargs,
     ) -> float:
-        return float(len(parser.segment_steps(completion)))
+        steps = await self._ensure_steps(parser, prompt, completion, state)
+        return float(len(steps))

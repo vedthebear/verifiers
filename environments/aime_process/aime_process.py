@@ -16,8 +16,9 @@ def load_environment(
     system_prompt: str = SYSTEM_PROMPT,
     num_train_examples: int = -1,
     num_eval_examples: int = -1,
-    judge_model: str = "anthropic/claude-haiku-4.5",
-    judge_base_url: str = OPENROUTER_BASE_URL,
+    segmenter_model: str = "openai/gpt-4o-mini",
+    judge_model: str = "anthropic/claude-sonnet-4.6",
+    openrouter_base_url: str = OPENROUTER_BASE_URL,
     answer_weight: float = 1.0,
     step_weight: float = 0.5,
 ) -> vf.SingleTurnEnv:
@@ -25,9 +26,14 @@ def load_environment(
 
     Train split: AIME 2024. Eval split: AIME 2026 (held out — released after
     most current models' training cutoffs).
-    Reward = answer correctness + per-step validity from an OpenRouter-hosted
-    judge model. Completion size and step count are reported as pure metrics
-    (weight 0) so efficiency is visible without shaping the reward by default.
+
+    Reward = answer correctness + per-step validity. Step boundaries are
+    identified by a cheap segmenter model (default gpt-4o-mini); each step is
+    then graded independently with prior-only context by a stronger judge
+    model (default Claude Sonnet 4.6) to avoid hindsight bias.
+
+    Completion size and step count are reported as pure metrics (weight 0)
+    so efficiency is visible without shaping the reward by default.
     """
     vf.ensure_keys(["OPENROUTER_API_KEY"])
 
@@ -43,14 +49,16 @@ def load_environment(
             ds = ds.select(range(num_eval_examples))
         return ds
 
-    judge_client = AsyncOpenAI(
-        base_url=judge_base_url,
+    openrouter_client = AsyncOpenAI(
+        base_url=openrouter_base_url,
         api_key=os.environ["OPENROUTER_API_KEY"],
     )
     parser = AIMECoTParser()
     rubric = AIMEProcessRubric(
         parser=parser,
-        judge_client=judge_client,
+        segmenter_client=openrouter_client,
+        segmenter_model=segmenter_model,
+        judge_client=openrouter_client,
         judge_model=judge_model,
         answer_weight=answer_weight,
         step_weight=step_weight,
